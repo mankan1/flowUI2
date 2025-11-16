@@ -26,6 +26,13 @@ const OptionsFlowClient = () => {
   const [stats, setStats] = useState(null);          // TRADING_STATS payload
   const [autoTrades, setAutoTrades] = useState([]);  // subset of trades flagged as auto
 
+  // NEW: per-symbol and overall flow metrics (cumulative delta-based score)
+  const [symbolFlow, setSymbolFlow] = useState({});  // { [symbol]: { netDelta } }
+  const [overallFlow, setOverallFlow] = useState({
+    label: 'NEUTRAL',
+    score: 0
+  });
+
   const [filters, setFilters] = useState({
     symbol: '',
     minPremium: 0,
@@ -40,6 +47,180 @@ const OptionsFlowClient = () => {
   const printCount = prints.length;
   const quoteCount = Object.keys(quotes).length + Object.keys(ulQuotes).length;
   const autoCount = autoTrades.length;
+
+  /* ========================= HELPERS (formatting) ========================= */
+
+  const formatTime = (timestamp) => {
+    if (!timestamp) return '';
+    const d = new Date(timestamp);
+    return d.toLocaleTimeString('en-US', {
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    });
+  };
+
+  const safeToFixed = (value, digits = 2, fallback = 'N/A') => {
+    if (value === null || value === undefined || Number.isNaN(value)) {
+      return fallback;
+    }
+    return Number(value).toFixed(digits);
+  };
+
+  const formatPremium = (premium = 0) => {
+    if (premium >= 1_000_000) return `$${(premium / 1_000_000).toFixed(2)}M`;
+    if (premium >= 1_000) return `$${(premium / 1_000).toFixed(0)}k`;
+    return `$${premium.toFixed(0)}`;
+  };
+
+  // NEW: pretty-print delta flow score
+  const formatDeltaScore = (value = 0) => {
+    const v = Number(value) || 0;
+    const sign = v > 0 ? '+' : v < 0 ? '-' : '';
+    const abs = Math.abs(v);
+    if (abs >= 1_000_000) return `${sign}${(abs / 1_000_000).toFixed(1)}M Δ`;
+    if (abs >= 1_000) return `${sign}${(abs / 1_000).toFixed(1)}k Δ`;
+    return `${sign}${abs.toFixed(0)} Δ`;
+  };
+
+  const getStanceColor = (stanceLabel) => {
+    if (stanceLabel === 'BULL') return 'text-green-400';
+    if (stanceLabel === 'BEAR') return 'text-red-400';
+    return 'text-yellow-400';
+  };
+
+  const getStanceBg = (stanceLabel) => {
+    if (stanceLabel === 'BULL') return 'bg-green-900/30 border-green-500';
+    if (stanceLabel === 'BEAR') return 'bg-red-900/30 border-red-500';
+    return 'bg-yellow-900/30 border-yellow-500';
+  };
+
+  const getClassificationBadges = (classifications) => {
+    if (!classifications || !classifications.length) return null;
+    return classifications.map((cls) => {
+      let bg = 'bg-gray-700';
+      if (cls === 'SWEEP') bg = 'bg-red-600';
+      else if (cls === 'BLOCK') bg = 'bg-orange-600';
+      else if (cls === 'NOTABLE') bg = 'bg-green-600';
+      return (
+        <span
+          key={cls}
+          className={`px-2 py-1 text-xs font-bold rounded ${bg}`}
+        >
+          {cls}
+        </span>
+      );
+    });
+  };
+
+  const getDirectionStyle = (direction) => {
+    const styles = {
+      BTO: 'bg-green-700 text-white',
+      STO: 'bg-orange-700 text-white',
+      BTC: 'bg-cyan-700 text-white',
+      STC: 'bg-purple-700 text-white'
+    };
+    return styles[direction] || 'bg-gray-700 text-white';
+  };
+
+  const getMapping = (conid) => {
+    return conidMapping[conid] || { symbol: 'Unknown', type: 'OPT' };
+  };
+
+  const getCurrentULPrice = (ulConid) => {
+    const q = ulQuotes[ulConid];
+    return q ? q.last : undefined;
+  };
+
+  const calculatePnL = (trade) => {
+    const entry = trade.optionPrice ?? trade.initialPrice ?? 0;
+    const current = trade.currentPrice ?? entry;
+    const contracts = trade.size || 1;
+    const multiplier = trade.multiplier || 100;
+
+    if (!entry) {
+      return { dollarPnL: 0, percentPnL: 0 };
+    }
+
+    const priceDiff = current - entry;
+    const dollarPnL = priceDiff * contracts * multiplier;
+    const percentPnL = (priceDiff / entry) * 100;
+
+    return { dollarPnL, percentPnL };
+  };
+
+  /* ========================= FLOW METRICS (NEW) ========================= */
+
+  // Use delta * size * multiplier, then adjust by BTO/BTC/STO/STC to get delta *change*
+  const updateFlowMetrics = useCallback(
+    (trade) => {
+      const delta = trade.greeks?.delta;
+      if (delta === null || delta === undefined) return;
+
+      const contracts = trade.size || 0;
+      if (!contracts) return;
+
+      const multiplier = trade.multiplier || 100;
+      const rawDelta = delta * contracts * multiplier; // signed by option type
+
+      if (!Number.isFinite(rawDelta) || rawDelta === 0) return;
+
+      const dir = trade.direction;
+      let factor = 0;
+      // Interpret as net change in position:
+      // BTO: +delta, BTC: -delta, STO: -delta, STC: +delta
+      switch (dir) {
+        case 'BTO':
+          factor = 1;
+          break;
+        case 'STO':
+          factor = -1;
+          break;
+        case 'BTC':
+          factor = -1;
+          break;
+        case 'STC':
+          factor = 1;
+          break;
+        default:
+          factor = 0;
+      }
+      if (factor === 0) return;
+
+      const netChange = rawDelta * factor;
+      const sym = trade.symbol || 'UNKNOWN';
+
+      setSymbolFlow((prev) => {
+        const prevEntry = prev[sym] || { netDelta: 0 };
+        const newNet = prevEntry.netDelta + netChange;
+        const updated = {
+          ...prev,
+          [sym]: {
+            ...prevEntry,
+            netDelta: newNet
+          }
+        };
+
+        // Recompute overall score as sum of netDelta across symbols
+        const totalNet = Object.values(updated).reduce(
+          (acc, entry) => acc + (entry.netDelta || 0),
+          0
+        );
+
+        // Simple dead zone so tiny flows don't constantly flip the label
+        const THRESH = 10_000;
+        let label = 'NEUTRAL';
+        if (totalNet > THRESH) label = 'BULL';
+        else if (totalNet < -THRESH) label = 'BEAR';
+
+        setOverallFlow({ label, score: totalNet });
+
+        return updated;
+      });
+    },
+    [setSymbolFlow, setOverallFlow]
+  );
 
   /* ========================= WS HANDLER ========================= */
 
@@ -81,6 +262,9 @@ const OptionsFlowClient = () => {
             priceChange: 0,
             priceChangePct: 0
           };
+
+          // NEW: update cumulative delta-based flow metrics
+          updateFlowMetrics(enriched);
 
           setTrades((prev) => [enriched, ...prev].slice(0, 200));
 
@@ -168,7 +352,7 @@ const OptionsFlowClient = () => {
     };
 
     wsRef.current = ws;
-  }, []);
+  }, [updateFlowMetrics]);
 
   useEffect(() => {
     connectWebSocket();
@@ -176,98 +360,6 @@ const OptionsFlowClient = () => {
       if (wsRef.current) wsRef.current.close();
     };
   }, [connectWebSocket]);
-
-  /* ========================= HELPERS ========================= */
-
-  const getMapping = (conid) => {
-    return conidMapping[conid] || { symbol: 'Unknown', type: 'OPT' };
-  };
-
-  const formatTime = (timestamp) => {
-    if (!timestamp) return '';
-    const d = new Date(timestamp);
-    return d.toLocaleTimeString('en-US', {
-      hour12: false,
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit'
-    });
-  };
-
-  const safeToFixed = (value, digits = 2, fallback = 'N/A') => {
-    if (value === null || value === undefined || Number.isNaN(value)) {
-      return fallback;
-    }
-    return Number(value).toFixed(digits);
-  };
-
-  const formatPremium = (premium = 0) => {
-    if (premium >= 1_000_000) return `$${(premium / 1_000_000).toFixed(2)}M`;
-    if (premium >= 1_000) return `$${(premium / 1_000).toFixed(0)}k`;
-    return `$${premium.toFixed(0)}`;
-  };
-
-  const getStanceColor = (stanceLabel) => {
-    if (stanceLabel === 'BULL') return 'text-green-400';
-    if (stanceLabel === 'BEAR') return 'text-red-400';
-    return 'text-yellow-400';
-  };
-
-  const getStanceBg = (stanceLabel) => {
-    if (stanceLabel === 'BULL') return 'bg-green-900/30 border-green-500';
-    if (stanceLabel === 'BEAR') return 'bg-red-900/30 border-red-500';
-    return 'bg-yellow-900/30 border-yellow-500';
-  };
-
-  const getClassificationBadges = (classifications) => {
-    if (!classifications || !classifications.length) return null;
-    return classifications.map((cls) => {
-      let bg = 'bg-gray-700';
-      if (cls === 'SWEEP') bg = 'bg-red-600';
-      else if (cls === 'BLOCK') bg = 'bg-orange-600';
-      else if (cls === 'NOTABLE') bg = 'bg-green-600';
-      return (
-        <span
-          key={cls}
-          className={`px-2 py-1 text-xs font-bold rounded ${bg}`}
-        >
-          {cls}
-        </span>
-      );
-    });
-  };
-
-  const getDirectionStyle = (direction) => {
-    const styles = {
-      BTO: 'bg-green-700 text-white',
-      STO: 'bg-orange-700 text-white',
-      BTC: 'bg-cyan-700 text-white',
-      STC: 'bg-purple-700 text-white'
-    };
-    return styles[direction] || 'bg-gray-700 text-white';
-  };
-
-  const getCurrentULPrice = (ulConid) => {
-    const q = ulQuotes[ulConid];
-    return q ? q.last : undefined;
-  };
-
-  const calculatePnL = (trade) => {
-    const entry = trade.optionPrice ?? trade.initialPrice ?? 0;
-    const current = trade.currentPrice ?? entry;
-    const contracts = trade.size || 1;
-    const multiplier = trade.multiplier || 100;
-
-    if (!entry) {
-      return { dollarPnL: 0, percentPnL: 0 };
-    }
-
-    const priceDiff = current - entry;
-    const dollarPnL = priceDiff * contracts * multiplier;
-    const percentPnL = (priceDiff / entry) * 100;
-
-    return { dollarPnL, percentPnL };
-  };
 
   /* ========================= FILTERED DATA ========================= */
 
@@ -316,9 +408,70 @@ const OptionsFlowClient = () => {
           </div>
         </div>
 
-        <div className="text-sm text-gray-400 mb-4">
+        <div className="text-sm text-gray-400 mb-2">
           Equities + Futures • ~25 ATM strikes • ~15 DTE • Live quotes, prints
           &amp; BTO/STO/BTC/STC classifications
+        </div>
+
+        {/* NEW: Overall and per-symbol flow summary (cumulative delta) */}
+        <div className="flex flex-col gap-2 mb-4">
+          {/* Overall flow chip */}
+          <div className="flex items-center gap-3">
+            <div
+              className={`flex items-center gap-2 px-3 py-1 rounded-full border ${
+                overallFlow.label === 'BULL'
+                  ? 'border-green-500 bg-green-900/30'
+                  : overallFlow.label === 'BEAR'
+                  ? 'border-red-500 bg-red-900/30'
+                  : 'border-yellow-500 bg-yellow-900/20'
+              }`}
+            >
+              {overallFlow.label === 'BULL' ? (
+                <TrendingUp className="w-4 h-4 text-green-400" />
+              ) : overallFlow.label === 'BEAR' ? (
+                <TrendingDown className="w-4 h-4 text-red-400" />
+              ) : (
+                <Activity className="w-4 h-4 text-yellow-400" />
+              )}
+              <span className="text-xs text-gray-300 uppercase tracking-wide">
+                Overall Flow
+              </span>
+              <span className="font-semibold text-sm">
+                {overallFlow.label}
+              </span>
+              <span className="text-xs text-gray-300">
+                {formatDeltaScore(overallFlow.score)}
+              </span>
+            </div>
+          </div>
+
+          {/* Per-symbol chips */}
+          <div className="flex flex-wrap gap-2">
+            {Object.entries(symbolFlow).map(([sym, flow]) => {
+              const net = flow.netDelta || 0;
+              const label =
+                net > 0 ? 'BULL' : net < 0 ? 'BEAR' : 'NEUTRAL';
+              const chipColor =
+                label === 'BULL'
+                  ? 'bg-green-900/30 border-green-500 text-green-200'
+                  : label === 'BEAR'
+                  ? 'bg-red-900/30 border-red-500 text-red-200'
+                  : 'bg-gray-800 border-gray-600 text-gray-200';
+
+              return (
+                <div
+                  key={sym}
+                  className={`px-3 py-1 rounded-full border text-xs flex items-center gap-2 ${chipColor}`}
+                >
+                  <span className="font-semibold">{sym}</span>
+                  <span>{label}</span>
+                  <span className="text-[0.7rem] text-gray-300">
+                    {formatDeltaScore(net)}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
         </div>
 
         {/* Quick symbol buttons (just set symbol filter for now) */}
@@ -343,19 +496,27 @@ const OptionsFlowClient = () => {
           <div>
             <div className="text-xs text-gray-500 mb-2">Equities:</div>
             <div className="flex flex-wrap gap-2">
-              {['SPY', 'QQQ', 'AAPL', 'TSLA', 'NVDA', 'AMZN', 'MSFT', 'META', 'GOOGL'].map(
-                (sym) => (
-                  <button
-                    key={sym}
-                    className="px-4 py-2 bg-gray-800 hover:bg-purple-700 rounded font-semibold transition-colors text-sm"
-                    onClick={() =>
-                      setFilters((prev) => ({ ...prev, symbol: sym }))
-                    }
-                  >
-                    {sym}
-                  </button>
-                )
-              )}
+              {[
+                'SPY',
+                'QQQ',
+                'AAPL',
+                'TSLA',
+                'NVDA',
+                'AMZN',
+                'MSFT',
+                'META',
+                'GOOGL'
+              ].map((sym) => (
+                <button
+                  key={sym}
+                  className="px-4 py-2 bg-gray-800 hover:bg-purple-700 rounded font-semibold transition-colors text-sm"
+                  onClick={() =>
+                    setFilters((prev) => ({ ...prev, symbol: sym }))
+                  }
+                >
+                  {sym}
+                </button>
+              ))}
             </div>
           </div>
         </div>
@@ -636,11 +797,7 @@ const OptionsFlowClient = () => {
                   <div>
                     <div className="text-gray-500 text-xs">Delta</div>
                     <div className="font-semibold text-blue-400">
-                      {safeToFixed(
-                        trade.greeks?.delta,
-                        3,
-                        'N/A'
-                      )}
+                      {safeToFixed(trade.greeks?.delta, 3, 'N/A')}
                     </div>
                   </div>
                   <div>
@@ -660,8 +817,7 @@ const OptionsFlowClient = () => {
                   <div>
                     <div className="text-gray-500 text-xs">OI</div>
                     <div className="font-semibold">
-                      {trade.openInterest?.toLocaleString?.() ??
-                        'N/A'}
+                      {trade.openInterest?.toLocaleString?.() ?? 'N/A'}
                     </div>
                   </div>
                   <div>
@@ -725,8 +881,7 @@ const OptionsFlowClient = () => {
                         <div className="text-gray-500">OI Δ</div>
                         <div
                           className={`font-semibold ${
-                            (trade.historicalComparison.oiChange || 0) >
-                            0
+                            (trade.historicalComparison.oiChange || 0) > 0
                               ? 'text-green-400'
                               : 'text-red-400'
                           }`}
@@ -734,16 +889,14 @@ const OptionsFlowClient = () => {
                           {trade.historicalComparison.oiChange > 0
                             ? '+'
                             : ''}
-                          {trade.historicalComparison.oiChange ??
-                            0}
+                          {trade.historicalComparison.oiChange ?? 0}
                         </div>
                       </div>
                       <div>
                         <div className="text-gray-500">Vol Multiple</div>
                         <div
                           className={`font-semibold ${
-                            (trade.historicalComparison.volumeMultiple ||
-                              0) > 2
+                            (trade.historicalComparison.volumeMultiple || 0) > 2
                               ? 'text-yellow-400'
                               : ''
                           }`}
@@ -759,8 +912,7 @@ const OptionsFlowClient = () => {
                       <div>
                         <div className="text-gray-500">Data Points</div>
                         <div className="font-semibold">
-                          {trade.historicalComparison.dataPoints ??
-                            'N/A'}
+                          {trade.historicalComparison.dataPoints ?? 'N/A'}
                         </div>
                       </div>
                     </div>
@@ -888,11 +1040,7 @@ const OptionsFlowClient = () => {
                       last{' '}
                       <span className="text-purple-400">
                         $
-                        {safeToFixed(
-                          quote.last,
-                          2,
-                          '--'
-                        )}
+                        {safeToFixed(quote.last, 2, '--')}
                       </span>
                     </div>
                     <div className="text-sm text-gray-400">
@@ -958,33 +1106,21 @@ const OptionsFlowClient = () => {
                       last{' '}
                       <span className="text-cyan-400">
                         $
-                        {safeToFixed(
-                          quote.last,
-                          2,
-                          '--'
-                        )}
+                        {safeToFixed(quote.last, 2, '--')}
                       </span>
                     </div>
                     <div className="text-sm text-gray-400">
                       bid{' '}
                       <span className="text-green-400">
                         $
-                        {safeToFixed(
-                          quote.bid,
-                          2,
-                          '--'
-                        )}
+                        {safeToFixed(quote.bid, 2, '--')}
                       </span>
                     </div>
                     <div className="text-sm text-gray-400">
                       ask{' '}
                       <span className="text-red-400">
                         $
-                        {safeToFixed(
-                          quote.ask,
-                          2,
-                          '--'
-                        )}
+                        {safeToFixed(quote.ask, 2, '--')}
                       </span>
                     </div>
 
@@ -1265,4 +1401,3 @@ const OptionsFlowClient = () => {
 };
 
 export default OptionsFlowClient;
-
